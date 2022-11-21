@@ -5,14 +5,18 @@ namespace Minimal_Painting_Demo;
 
 public partial class Form1 : Form
 {
-    private static readonly Random random = new ();
+    private static readonly Random Random = new();
 
-    private readonly Bitmap bmp = new(2048, 2048, PixelFormat.Format32bppArgb);
+    // Using Format32bppPArgb (premultiplied alpha) should improve GDI+ image drawing speed, at the cost of more calculations per brush dab 
+    private readonly Bitmap bmp = new(1000, 1000, PixelFormat.Format32bppArgb);
     private BitmapData bmpData;
     private unsafe byte* scan0;
     private bool bmpLocked;
 
     private readonly Matrix canvasTransform = new();
+    /// <summary>
+    /// Just holds the size of the bitmap, used as convenience
+    /// </summary>
     private readonly Rectangle canvasRect;
     private bool mouseDown, prevMouseDown, panning;
     private Point mouseDownPos;
@@ -22,21 +26,23 @@ public partial class Form1 : Form
     public Form1()
     {
         InitializeComponent();
-        // Some events are not accessible from designer
+        // Some events are not accessible from the designer
         pictureBox1.MouseWheel += pictureBox1_MouseWheel;
-
+        
         canvasRect = new Rectangle(Point.Empty, bmp.Size);
     }
 
-    private unsafe void DoDrawing(PointF mousePos)
+    private unsafe void DoPainting(PointF mousePos)
     {
         var invertedCanvasMatrix = canvasTransform.Clone();
         invertedCanvasMatrix.Invert();
-        var canvasMousePos = new PointF(
-            (mousePos.X * invertedCanvasMatrix.Elements[0] + mousePos.Y * invertedCanvasMatrix.Elements[2]) + invertedCanvasMatrix.Elements[4],
-            (mousePos.X * invertedCanvasMatrix.Elements[1] + mousePos.Y * invertedCanvasMatrix.Elements[3]) + invertedCanvasMatrix.Elements[5]);
 
-        if (!canvasRect.Contains((int)canvasMousePos.X, (int)canvasMousePos.Y))
+        // Since there's no method to just transform one point, we'll make an array of size 1
+        var tmpArray = new[] { mousePos };
+        invertedCanvasMatrix.TransformPoints(tmpArray);
+        var relativeMousePos = tmpArray[0];
+
+        if (!canvasRect.Contains((int)relativeMousePos.X, (int)relativeMousePos.Y))
         {
             return;
         }
@@ -48,47 +54,50 @@ public partial class Form1 : Form
             scan0 = (byte*)bmpData.Scan0.ToPointer();
         }
 
-        const int dabSize = 128;
+        const int dabSize = 25;
 
         if (!prevMouseDown) // Mouse was just pressed 
         {
-            prevDabPos = canvasMousePos;
-            Dab((int)canvasMousePos.X, (int)canvasMousePos.Y, dabSize, dabColor);
+            prevDabPos = relativeMousePos;
+            Dab((int)relativeMousePos.X, (int)relativeMousePos.Y, dabSize, dabColor);
             pictureBox1.Invalidate();
         }
         else
         {
             var dabDistance = (float)Math.Sqrt(
-                ((prevDabPos.X - canvasMousePos.X) * (prevDabPos.X - canvasMousePos.X)) +
-                ((prevDabPos.Y - canvasMousePos.Y) * (prevDabPos.Y - canvasMousePos.Y)));
+                ((prevDabPos.X - relativeMousePos.X) * (prevDabPos.X - relativeMousePos.X)) +
+                ((prevDabPos.Y - relativeMousePos.Y) * (prevDabPos.Y - relativeMousePos.Y)));
 
             const float spacing = .5f;
-
             if (dabDistance < spacing)
             {
                 return;
             }
 
+            // Interpolate between strokes. This is standard in most brush engines
             var nx = prevDabPos.X;
             var ny = prevDabPos.Y;
             var df = spacing / dabDistance;
             for (var f = df; f <= 1f; f += df)
             {
-                nx = (f * canvasMousePos.X) + ((1f - f) * prevDabPos.X);
-                ny = (f * canvasMousePos.Y) + ((1f - f) * prevDabPos.Y);
+                nx = (f * relativeMousePos.X) + ((1f - f) * prevDabPos.X);
+                ny = (f * relativeMousePos.Y) + ((1f - f) * prevDabPos.Y);
                 Dab((int)nx, (int)ny, dabSize, dabColor);
             }
 
             prevDabPos.X = nx;
             prevDabPos.Y = ny;
-            pictureBox1.Invalidate(); // TODO - We should only be invalidating the area that was updated
+            // TODO: We should only be invalidating the area that was updated. This will slow down performance a lot as the bitmap size increases
+            pictureBox1.Invalidate(); 
         }
     }
 
+    // For maximum performance ideally we would have this function written in a C library, which can then be P/Invoked
     private unsafe void Dab(int centerX, int centerY, int size, Color color)
     {
         size /= 2;
-        for (var x = -size; x < size; x++)
+        // Basic multithreading here still nets us more performance, obviously it can be refined
+        Parallel.For(-size, size, x =>
         {
             for (var y = -size; y < size; y++)
             {
@@ -114,7 +123,7 @@ public partial class Form1 : Form
                 g = gOut;
                 b = bOut;
             }
-        }
+        });
     }
 
     // https://stackoverflow.com/a/64655571/9286324
@@ -142,18 +151,25 @@ public partial class Form1 : Form
 
     private void pictureBox1_Paint(object sender, PaintEventArgs e)
     {
+        // https://stackoverflow.com/a/11025428/9286324
         var g = e.Graphics;
+        // TODO: On initialization, fill the bitmap with our canvas color instead of it being transparent
+        //g.CompositingMode = CompositingMode.SourceCopy;
         g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        g.CompositingQuality = CompositingQuality.HighSpeed;
+        g.SmoothingMode = SmoothingMode.HighSpeed;
 
-        e.Graphics.Transform = canvasTransform;
-        e.Graphics.FillRectangle(Brushes.White, canvasRect);
+        g.Transform = canvasTransform;
+        // If our bitmap is filled beforehand we won't need to render this
+        g.FillRectangle(Brushes.White, canvasRect);
 
         if (bmpLocked)
         {
             bmpLocked = false;
             bmp.UnlockBits(bmpData);
         }
-        e.Graphics.DrawImageUnscaled(bmp, canvasRect);
+        // GDI+ is slow to draw images, perhaps using GDI would be faster?
+        g.DrawImageUnscaled(bmp, canvasRect);
     }
 
     private void pictureBox1_MouseMove(object sender, MouseEventArgs e)
@@ -163,6 +179,8 @@ public partial class Form1 : Form
             return;
         }
 
+        prevMouseDown = true;
+
         if (panning)
         {
             canvasTransform.Translate(e.Location.X - mouseDownPos.X, e.Location.Y - mouseDownPos.Y, MatrixOrder.Append);
@@ -171,7 +189,7 @@ public partial class Form1 : Form
         }
         else
         {
-            DoDrawing(e.Location);
+            DoPainting(e.Location);
         }
     }
 
@@ -196,22 +214,23 @@ public partial class Form1 : Form
     }
 
     // A stylus will also trigger the control's mouse events.
-    // An implementation of Wintab will be necessary for the stylus to handle smoothly though.
+    // An implementation of Wintab or Windows Ink will be necessary for the stylus to handle smoothly though.
 
     private void pictureBox1_MouseDown(object sender, MouseEventArgs e)
     {
-        if (e.Button == MouseButtons.Right)
-        {
-            panning = true;
-
-            pictureBox1.Cursor = Cursors.Hand;
-        }
-
         prevMouseDown = mouseDown;
         mouseDown = true;
         mouseDownPos = e.Location;
-        
-        dabColor = Color.FromArgb(16, random.Next(255), random.Next(255), random.Next(255));
+        if (e.Button == MouseButtons.Right)
+        {
+            panning = true;
+            pictureBox1.Cursor = Cursors.Hand;
+            return;
+        }
+
+        dabColor = Color.FromArgb(16, Random.Next(255), Random.Next(255), Random.Next(255));
+
+        DoPainting(e.Location);
     }
 
     private void pictureBox1_MouseUp(object sender, MouseEventArgs e)
